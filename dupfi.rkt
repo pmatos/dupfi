@@ -1,18 +1,35 @@
 #lang racket
 
 (require file/md5)
+(require (planet synx/stat))
 
-(define-struct file
+(define *cache-file* (build-path (find-system-path 'home-dir) ".dupfi.cache"))
+(define *cache* (make-parameter (make-hash)))
+(define *cache-diff-max* 1000)
+
+(struct file
   (name
    path
    chksum)
-  #:transparent)
+  #:transparent
+  #:constructor-name make-raw-file)
 
 (define-struct dir
   (name
    path
    contents)
   #:transparent)
+
+(define old-cache?
+  (let ([cache-counter 0])
+    (lambda ()
+      (if (= cache-counter *cache-diff-max*)
+          (begin
+            (set! cache-counter 0)
+            #t)
+          (begin
+            (set! cache-counter (+ cache-counter 1))
+            #f)))))
 
 (define (file< f1 f2)
   ; sort two files alphabetically
@@ -21,8 +38,92 @@
 (define (file= f1 f2)
   (and (file? f1) (file? f2)
        (string=? (file-name f1) (file-name f2))
-       (bytes=? (touch (file-chksum f1)) (touch (file-chksum f2)))))
+       (bytes=? (file-chksum f1) (file-chksum f2))))
 
+;;
+;; Returns hash table
+;; (<path> (<modtime> . <hash>))
+;;
+(define (read-cache)
+  (*cache* (make-hash))
+  (when (file-exists? *cache-file*)
+    (call-with-input-file *cache-file*
+      (lambda (in)
+        (let loop ([line (read-line in)])
+          (when (not (eof-object? line))
+            (let ([split-str (string-split line ",")])
+              (cond 
+                [(not (= (length split-str) 3))
+                 (printf "[1] read-cache fails, unexpected line in cache file: ~a, ignoring.~n" line)
+                 (loop (read-line in))]
+                [else 
+                 (let ([path (first split-str)]
+                       [modtime (string->number (string-trim (second split-str)))]
+                       [md5 (string->bytes/utf-8 (string-trim (third split-str)))])
+                   (cond 
+                     [(or (not path) (not modtime) (not md5))
+                      (printf "[2] read-cache fails, unexpected line in cache file: ~a, ignoring.~n" line)
+                      (loop (read-line in))]
+                     [(not modtime)
+                      (error "fail")] ;; unreachable?
+                     [else 
+                      (hash-set! (*cache*) path (cons modtime md5))
+                      (loop (read-line in))]))])))))
+      #:mode 'text))
+  (printf "cache has ~a entries~n" (hash-count (*cache*))))
+
+(define (write-cache)
+  (call-with-output-file *cache-file*
+    (lambda (out)
+      (hash-for-each (*cache*)
+                     (lambda (key val)
+                       (when (not (string? key))
+                         (error "writing cache failed, key is not string: " key))
+                       (when (not (number? (car val)))
+                         (error "writing cache failed, modtime is not number: " (car val)))
+                       (when (not (bytes? (cdr val)))
+                         (error "writing cache failed, md5 is not bytes: " (cdr val)))
+                       (fprintf out "~a, ~a, ~a~n" key (car val) (bytes->string/utf-8 (cdr val))))))
+    #:mode 'text
+    #:exists 'replace))
+
+(define (dump-cache)
+  (printf "CACHE DUMP:~n")
+  (hash-for-each (*cache*)
+   (lambda (key val)
+     (let ([modtime (car val)]
+           [md5 (cdr val)])
+       (printf "~a: ~a,~a~n"
+               key modtime md5))))
+  (printf "CACHE DUMP DONE~n"))
+
+(define (make-file name path)
+  ; Checks if file is in cache, if it is and modification seconds are the same, returns cached file.
+  ; Otherwise, it calculates its md5sum and adds file to cache.
+  (let* ([fullpath (build-path path name)]
+         [modtime (file-or-directory-modify-seconds fullpath)]
+         [val (hash-ref (*cache*) (path->string fullpath) (lambda () #f))])
+    (if (and val (= (car val) modtime))
+        (begin
+          (printf "found cache for file ~a~n" (path->string fullpath))
+          (make-raw-file name path (cdr val)))
+        (let ([md5 (begin
+                     (printf "computing md5 for ~a~n" fullpath)
+                     (if (normal-file? (type-bits fullpath))
+                       (call-with-input-file fullpath md5)
+                       (string->bytes/utf-8 "0")))])
+          (if (not val)
+            (printf "file not in cache: ~a~n" (path->string fullpath))
+            (printf "file is in cache but modify times are different: old ~a, new ~a~n" (car val) modtime))
+              
+          (when val
+            (hash-remove! (*cache*) fullpath))
+          (hash-set! (*cache*) (path->string fullpath) (cons modtime md5))
+          (when (old-cache?)
+            (printf "found old cache, WRITING CACHE~n")
+            (write-cache))
+          (make-raw-file name path md5)))))
+  
 (define (chkfile p)
   ; path -> file
   ; given a path to a file that exists, it returns its structure
@@ -30,11 +131,10 @@
     (error 'chkfile "path ~a doesn't point to valid file" (path->string p)))
   
   (let-values ([(base name must-be-dir?) (split-path p)])
-    (make-file (path->string name) base 
-               (future (lambda () (call-with-input-file p md5))))))
+    (make-file (path->string name) base)))
     
 (define (file-sig f)
-  (bytes-append (string->bytes/utf-8 (string-append (file-name f) ":")) (touch (file-chksum f))))
+  (bytes-append (string->bytes/utf-8 (string-append (file-name f) ":")) (file-chksum f)))
 
 (define (dir< d1 d2)
   ; sort two directories alphabetically with the directories coming first
@@ -125,11 +225,13 @@
 (define (partition-items i)
   (define (flatten-item i) 
     ; return a list of dir and of all its content objects
+    (printf "f")
     (if (file? i)
         (list i)
         (cons i (append-map flatten-item (dir-contents i)))))
   
   (define (group-equal groups rem)
+    (printf "g")
     (if (null? rem)
         groups
         (let* ([item (caar rem)]
@@ -142,13 +244,25 @@
                   (group-equal groups others)
                   (group-equal (cons (cons item dupitems) groups)
                                others)))))))
-  
-  (let* ([flat (flatten-item i)]
-         [sigs (map item-sig flat)]
+  (printf "Partitioning items")
+  (let* ([flat (begin (printf "Flattening~n") (flatten-item i))]
+         [sigs (begin (printf "Sigs~n") (map item-sig flat))]
          [flat (map cons flat sigs)])
     (group-equal '() flat)))
 
+(define (simplify-groups groups)
+  (printf "Simplifying groups~n")
+  ; Given a list of groups, it ensures the groups are as simple as possible.
+  ; It follows the following rules:
+  (sort groups (lambda (a b)
+                 (cond [(and (dir? (car a)) (dir? (car b)))
+                        (< (apply min (map (compose length explode-path dir-path) a))
+                           (apply min (map (compose length explode-path dir-path) b)))]
+                       [else 
+                        (and (dir? (car a)) (file? (car b)))]))))
+
 (define (display-results groups)
+  (printf "Displaying groups~n")
   (if (null? groups)
       (printf "no duplicate files~n")
       (for-each (lambda (group)
@@ -158,7 +272,7 @@
                                   (printf "F ~a~a: ~a~n"
                                           (file-path i)
                                           (file-name i)
-                                          (touch (file-chksum i)))
+                                          (file-chksum i))
                                   (printf "D ~a~a~n"
                                           (dir-path i)
                                           (dir-name i))))
@@ -166,5 +280,7 @@
                   (printf "--~n~n"))
                 groups)))
 
-;(current-command-line-arguments (vector "/localhome/pmatos/empty"))
-(display-results (partition-items (chkdir (vector-ref (current-command-line-arguments) 0))))
+(read-cache)
+
+(current-command-line-arguments (vector "/home/pmatos/Desktop/pmatos"))
+(display-results (simplify-groups (partition-items (chkdir (vector-ref (current-command-line-arguments) 0)))))
