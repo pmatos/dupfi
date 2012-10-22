@@ -1,4 +1,4 @@
-#lang racket
+#lang typed/racket
 
 ;    This program is free software: you can redistribute it and/or modify
 ;    it under the terms of the GNU General Public License as published by
@@ -20,17 +20,16 @@
 (define *cache* (make-parameter (make-hash)))
 (define *cache-diff-max* 1000)
 
-(struct file
-  (name
-   path
-   chksum)
-  #:transparent
-  #:constructor-name make-raw-file)
+(struct: file
+  ((name : String)
+   (path : Path)
+   (chksum : Bytes))
+  #:transparent)
 
-(define-struct dir
-  (name
-   path
-   contents)
+(struct: dir
+  ((name : String)
+   (path : Path)
+   (contents : (Listof file)))
   #:transparent)
 
 (define old-cache?
@@ -62,7 +61,7 @@
   (when (file-exists? *cache-file*)
     (call-with-input-file *cache-file*
       (lambda (in)
-        (let loop ([line (read-line in)])
+        (let: loop : Void ([line : String (read-line in)])
           (when (not (eof-object? line))
             (let ([split-str (string-split line ",")])
               (cond 
@@ -119,7 +118,7 @@
     (if (and val (= (car val) modtime))
         (begin
           (printf "found cache for file ~a~n" (path->string fullpath))
-          (make-raw-file name path (cdr val)))
+          (file name path (cdr val)))
         (let ([md5 (begin
                      (printf "computing md5 for ~a~n" fullpath)
                      (if (normal-file? (type-bits fullpath))
@@ -135,7 +134,7 @@
           (when (old-cache?)
             (printf "found old cache, WRITING CACHE~n")
             (write-cache))
-          (make-raw-file name path md5)))))
+          (file name path md5)))))
   
 (define (chkfile p)
   ; path -> file
@@ -183,7 +182,7 @@
     (error 'chkdir "path ~a doesn't point to a valid directory" (path->string p)))
   
   (let-values ([(base name must-be-dir?) (split-path p)])
-    (make-dir (path->string name) base
+    (dir (path->string name) base
               (sort (map (lambda (path)
                            (let ([path (build-path p path)])
                              (cond [(file-exists? path)
