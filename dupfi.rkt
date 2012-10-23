@@ -16,10 +16,6 @@
 (require file/md5)
 (require (planet synx/stat))
 
-(define *cache-file* (build-path (find-system-path 'home-dir) ".dupfi.cache"))
-(define *cache* (make-parameter (make-hash)))
-(define *cache-diff-max* 1000)
-
 (struct: file
   ((name : String)
    (path : Path)
@@ -31,6 +27,10 @@
    (path : Path)
    (contents : (Listof file)))
   #:transparent)
+
+(define *cache-file* (build-path (find-system-path 'home-dir) ".dupfi.cache"))
+(define: *cache* : (Parameterof (HashTable Path (Pairof Integer Bytes))) (make-parameter (make-hash)))
+(define *cache-diff-max* 1000)
 
 (define old-cache?
   (let ([cache-counter 0])
@@ -235,14 +235,14 @@
       (dir-sig i)))
 
 (define (partition-items i)
-  (define (flatten-item i) 
+  (define: (flatten-item (i : (U file dir))) : (Listof (U file dir))
     ; return a list of dir and of all its content objects
     (printf "f")
     (if (file? i)
         (list i)
         (cons i (append-map flatten-item (dir-contents i)))))
   
-  (define (group-equal groups rem)
+  (define: (group-equal (groups : (Listof (Listof (U file dir)))) (rem : (Listof (U file dir)))) : (Listof (Listof (U file dir))) 
     (printf "g")
     (if (null? rem)
         groups
